@@ -1,0 +1,78 @@
+' =====================================================
+' デバッグ・ログ管理クラス (DebugLogger.cls)
+' =====================================================
+Option Explicit
+
+Private pLogFileName As String
+Private pLogFolderPath As String
+Private pDebugEnabled As Boolean
+
+' コンストラクタ
+Private Sub Class_Initialize()
+    pDebugEnabled = False
+End Sub
+
+' デバッグログ初期化
+Public Sub Initialize(rootDir As String, bookName As String, isEnabled As Boolean)
+    pDebugEnabled = isEnabled
+    
+    If pDebugEnabled Then
+        ' ログフォルダパス作成
+        pLogFolderPath = rootDir & "\log"
+        
+        ' フォルダが存在しない場合は作成
+        If Dir(pLogFolderPath, vbDirectory) = "" Then
+            MkDir pLogFolderPath
+        End If
+        
+        ' ログファイル名生成
+        Dim cleanBookName As String
+        cleanBookName = Replace(bookName, ".xlsx", "")
+        cleanBookName = Replace(cleanBookName, ".xlsm", "")
+        cleanBookName = Replace(cleanBookName, ".xls", "")
+        
+        pLogFileName = pLogFolderPath & "\" & cleanBookName & "_log_" & Format(Now, "yyyymmddhhmm") & ".txt"
+        
+        ' 初期ログ出力
+        WriteLog "=== デバッグログ開始 ==="
+        WriteLog "処理開始時刻: " & Format(Now, "yyyy/mm/dd hh:nn:ss")
+        WriteLog "対象ブック: " & bookName
+        WriteLog ""
+    End If
+End Sub
+
+' ログ出力
+Public Sub WriteLog(message As String)
+    If Not pDebugEnabled Then Exit Sub
+    
+    Dim fileNum As Integer
+    On Error Resume Next
+    
+    fileNum = FreeFile
+    Open pLogFileName For Append As fileNum
+    Print #fileNum, Format(Now, "hh:nn:ss") & " | " & message
+    Close fileNum
+    
+    On Error GoTo 0
+End Sub
+
+' メソッド開始ログ
+Public Sub LogMethodStart(methodName As String, Optional params As String = "")
+    If pDebugEnabled Then
+        WriteLog ">>> " & methodName & "() 開始" & IIf(params <> "", " [" & params & "]", "")
+    End If
+End Sub
+
+' メソッド終了ログ
+Public Sub LogMethodEnd(methodName As String, Optional result As String = "")
+    If pDebugEnabled Then
+        WriteLog "<<< " & methodName & "() 終了" & IIf(result <> "", " -> " & result, "")
+    End If
+End Sub
+
+' エラーログ
+Public Sub LogError(methodName As String, errorDesc As String)
+    If pDebugEnabled Then
+        WriteLog "!!! エラー発生 in " & methodName & "(): " & errorDesc
+    End If
+End Sub

@@ -1,0 +1,191 @@
+' =====================================================
+' 設定管理クラス (ConfigManager.cls)
+' =====================================================
+Option Explicit
+
+' 定数定義（マジックナンバー・文字列の定数化）
+Private Const NA_VALUE As String = "#N/A"
+Private Const EMPTY_VALUE As String = ""
+Private Const INVALID_SHEET_CHARS As String = "\/?*[]:"
+Private Const MAX_SHEET_NAME_LENGTH As Integer = 31
+Private Const DEFAULT_SHEET_NAME As String = "Sheet1"
+
+Private pCategoryFolderMap As String
+Private pHeaderBackgroundColor As String
+Private pFilterDelay As Long
+Private pCopyPasteDelay As Long
+Private pWorkbookOpenDelay As Long
+Private pWorkbookCreateDelay As Long
+Private pSheetCreateDelay As Long
+Private pSaveDelay As Long
+Private pWorkbookCloseDelay As Long
+Private pTempSheetDelay As Long
+Private pFolderCreateDelay As Long
+Private pSaveRetryCount As Long
+Private pSaveVerifyDelay As Long
+Private pDebugMode As Boolean
+Private pSummaryOut As Boolean
+
+' コンストラクタ - デフォルト設定の読み込み
+Private Sub Class_Initialize()
+    ' 種別とフォルダの対応リスト
+    pCategoryFolderMap = _
+        "営業,Sales;" & _
+        "経理,Accounting;" & _
+        "総務,General;" & _
+        "開発,Development;" & _
+        "マーケティング,Marketing;" & _
+        "サポート,Support"
+    
+    ' ヘッダー行の背景色
+    pHeaderBackgroundColor = "#4472C4"
+    
+    ' 遅延設定（ミリ秒）
+    pFilterDelay = 200
+    pCopyPasteDelay = 500
+    pWorkbookOpenDelay = 800
+    pWorkbookCreateDelay = 300
+    pSheetCreateDelay = 200
+    pSaveDelay = 1000
+    pWorkbookCloseDelay = 300
+    pTempSheetDelay = 100
+    pFolderCreateDelay = 200
+    pSaveRetryCount = 3
+    pSaveVerifyDelay = 500
+    
+    ' デバッグ・サマリー設定
+    pDebugMode = True      ' デバッグモード（True で有効）
+    pSummaryOut = True      ' サマリー出力（True で有効）
+End Sub
+
+' プロパティ（読み取り専用）
+Public Property Get CategoryFolderMap() As String
+    CategoryFolderMap = pCategoryFolderMap
+End Property
+
+Public Property Get HeaderBackgroundColor() As String
+    HeaderBackgroundColor = pHeaderBackgroundColor
+End Property
+
+Public Property Get FilterDelay() As Long
+    FilterDelay = pFilterDelay
+End Property
+
+Public Property Get CopyPasteDelay() As Long
+    CopyPasteDelay = pCopyPasteDelay
+End Property
+
+Public Property Get WorkbookOpenDelay() As Long
+    WorkbookOpenDelay = pWorkbookOpenDelay
+End Property
+
+Public Property Get WorkbookCreateDelay() As Long
+    WorkbookCreateDelay = pWorkbookCreateDelay
+End Property
+
+Public Property Get SheetCreateDelay() As Long
+    SheetCreateDelay = pSheetCreateDelay
+End Property
+
+Public Property Get SaveDelay() As Long
+    SaveDelay = pSaveDelay
+End Property
+
+Public Property Get WorkbookCloseDelay() As Long
+    WorkbookCloseDelay = pWorkbookCloseDelay
+End Property
+
+Public Property Get TempSheetDelay() As Long
+    TempSheetDelay = pTempSheetDelay
+End Property
+
+Public Property Get FolderCreateDelay() As Long
+    FolderCreateDelay = pFolderCreateDelay
+End Property
+
+Public Property Get SaveRetryCount() As Long
+    SaveRetryCount = pSaveRetryCount
+End Property
+
+Public Property Get SaveVerifyDelay() As Long
+    SaveVerifyDelay = pSaveVerifyDelay
+End Property
+
+Public Property Get DebugMode() As Boolean
+    DebugMode = pDebugMode
+End Property
+
+Public Property Get SummaryOut() As Boolean
+    SummaryOut = pSummaryOut
+End Property
+
+' 定数取得プロパティ
+Public Property Get NAValue() As String
+    NAValue = NA_VALUE
+End Property
+
+Public Property Get EmptyValue() As String
+    EmptyValue = EMPTY_VALUE
+End Property
+
+Public Property Get InvalidSheetChars() As String
+    InvalidSheetChars = INVALID_SHEET_CHARS
+End Property
+
+Public Property Get MaxSheetNameLength() As Integer
+    MaxSheetNameLength = MAX_SHEET_NAME_LENGTH
+End Property
+
+Public Property Get DefaultSheetName() As String
+    DefaultSheetName = DEFAULT_SHEET_NAME
+End Property
+
+' 環境別設定の適用
+Public Sub ApplyEnvironmentSettings(envType As String)
+    Select Case UCase(envType)
+        Case "FAST" ' 高速ローカル環境
+            pFilterDelay = 50
+            pWorkbookOpenDelay = 200
+            pSaveDelay = 300
+            pCopyPasteDelay = 200
+            pSaveVerifyDelay = 200
+            
+        Case "CLOUD" ' クラウド環境
+            pFilterDelay = 500
+            pWorkbookOpenDelay = 1500
+            pSaveDelay = 2000
+            pCopyPasteDelay = 800
+            pSaveVerifyDelay = 1000
+            
+        Case "NETWORK" ' ネットワーク環境
+            pFilterDelay = 300
+            pWorkbookOpenDelay = 1000
+            pSaveDelay = 1500
+            pCopyPasteDelay = 600
+            pSaveVerifyDelay = 800
+            
+    End Select
+End Sub
+
+' 種別フォルダ対応辞書を作成
+Public Function CreateCategoryFolderDictionary() As Object
+    Dim dict As Object
+    Dim mappings As Variant
+    Dim categoryFolder As Variant
+    Dim i As Long
+    
+    Set dict = CreateObject("Scripting.Dictionary")
+    mappings = Split(pCategoryFolderMap, ";")
+    
+    For i = 0 To UBound(mappings)
+        If Trim(mappings(i)) <> EMPTY_VALUE Then
+            categoryFolder = Split(mappings(i), ",")
+            If UBound(categoryFolder) = 1 Then
+                dict.Add Trim(categoryFolder(0)), Trim(categoryFolder(1))
+            End If
+        End If
+    Next i
+    
+    Set CreateCategoryFolderDictionary = dict
+End Function
+

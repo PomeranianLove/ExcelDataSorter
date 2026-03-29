@@ -1,0 +1,976 @@
+' =====================================================
+' メインモジュール (DataSorterMain.bas)
+' =====================================================
+Option Explicit
+
+' Windows API Sleep関数の宣言
+#If VBA7 Then
+    Private Declare PtrSafe Sub Sleep Lib "kernel32" (ByVal dwMilliseconds As Long)
+#Else
+    Private Declare Sub Sleep Lib "kernel32" (ByVal dwMilliseconds As Long)
+#End If
+
+' グローバル変数
+Private logger As DebugLogger
+Private config As ConfigManager
+Private summaryData As Object
+Private failedSaves As Object
+
+' メイン処理関数
+Public Sub DataSorter()
+    On Error GoTo ErrorHandler
+    
+    Dim rootDir As String
+    Dim originalWs As Worksheet
+    Dim tempWs As Worksheet
+    Dim lastRow As Long, lastCol As Long
+    Dim payerCodeCol As Long, categoryCol As Long, remarksCol As Long
+    Dim categoryDict As Object
+    Dim payerCodeDict As Object
+    Dim category As Variant, payerCode As Variant
+    Dim processedCount As Long
+    Dim successCount As Long
+    Dim categoryFolderDict As Object
+    
+    ' 設定オブジェクトを作成
+    Set config = New ConfigManager
+    Set logger = New DebugLogger
+    Set summaryData = CreateObject("Scripting.Dictionary")
+    Set failedSaves = CreateObject("Scripting.Dictionary")
+    
+    ' 環境に応じて設定を変更する場合（オプション）
+    ' config.ApplyEnvironmentSettings "FAST"
+    
+    logger.LogMethodStart "DataSorter"
+    
+    ' 画面更新を停止して処理速度向上
+    Application.ScreenUpdating = False
+    Application.Calculation = xlCalculationManual
+    Application.EnableEvents = False
+    
+    ' 初期化
+    Set originalWs = ActiveSheet
+    processedCount = 0
+    successCount = 0
+    
+    ' ルートディレクトリ選択
+    rootDir = SelectRootDirectory()
+    If rootDir = config.EmptyValue Then
+        RestoreApplicationSettings
+        MsgBox "処理を中止しました。", vbInformation
+        Exit Sub
+    End If
+    
+    ' デバッグログ初期化
+    logger.Initialize rootDir, originalWs.Parent.Name, config.DebugMode
+    logger.WriteLog "ルートディレクトリ: " & rootDir
+    
+    ' 種別フォルダ対応辞書を作成
+    Set categoryFolderDict = config.CreateCategoryFolderDictionary()
+    logger.WriteLog "種別フォルダ辞書作成完了: " & categoryFolderDict.Count & " 件"
+    
+    ' 一時シート作成とデータコピー
+    Set tempWs = CreateTempSheet(originalWs)
+    Sleep config.TempSheetDelay
+    
+    ' データ範囲とカラム位置を取得
+    If Not GetDataRange(tempWs, lastRow, lastCol, payerCodeCol, categoryCol, remarksCol) Then
+        CleanupTempSheet tempWs
+        RestoreApplicationSettings
+        MsgBox "必要なカラム（支払先コード、種別、備考）が見つかりません。", vbCritical
+        Exit Sub
+    End If
+    
+    logger.WriteLog "データ範囲取得: " & lastRow & " 行 x " & lastCol & " 列"
+    logger.WriteLog "カラム位置 - 支払先:" & payerCodeCol & " 種別:" & categoryCol & " 備考:" & remarksCol
+    
+    ' ヘッダー行に背景色を設定
+    SetHeaderBackgroundColor tempWs, categoryCol, config.HeaderBackgroundColor
+    
+    ' 種別列以降の不要列を削除
+    DeleteColumnsAfterCategory tempWs, categoryCol, lastCol, lastRow
+    
+    ' 列数を再取得（削除後）
+    lastCol = categoryCol
+    
+    ' N/A除外フィルタを適用
+    ApplyNAFilter tempWs, categoryCol, lastRow, lastCol
+    Sleep config.FilterDelay
+    
+    ' 種別の一意リストを取得（Dictionary使用で高速化）
+    Set categoryDict = GetUniqueValuesDictionary(tempWs, categoryCol, lastRow)
+    logger.WriteLog "取得した種別数: " & categoryDict.Count
+    
+    ' 種別ごとにループ処理
+    Dim categoryKeys As Variant
+    categoryKeys = categoryDict.keys
+    Dim i As Long
+    
+    For i = 0 To UBound(categoryKeys)
+        category = categoryKeys(i)
+        If category <> config.NAValue And category <> config.EmptyValue Then
+            
+            logger.WriteLog "処理中の種別: " & category
+            
+            ' 進捗表示
+            Application.StatusBar = "処理中 - 種別: " & category
+            
+            ' 種別でフィルタ
+            ApplyCategoryFilter tempWs, categoryCol, category, lastRow, lastCol
+            Sleep config.FilterDelay
+            
+            ' 支払先コードの一意リストを取得（Dictionary使用）
+            Set payerCodeDict = GetUniqueValuesDictionary(tempWs, payerCodeCol, lastRow)
+            logger.WriteLog "種別 " & category & " の支払先コード数: " & payerCodeDict.Count
+            
+            ' 支払先コードごとにループ処理
+            Dim payerCodeKeys As Variant
+            payerCodeKeys = payerCodeDict.keys
+            Dim j As Long
+            
+            For j = 0 To UBound(payerCodeKeys)
+                payerCode = payerCodeKeys(j)
+                If payerCode <> config.NAValue And payerCode <> config.EmptyValue Then
+                    
+                    logger.WriteLog "処理中: " & category & " - " & payerCode
+                    
+                    ' 進捗表示
+                    Application.StatusBar = "処理中 - 種別: " & category & " | 支払先: " & payerCode
+                    
+                    ' 支払先コードでフィルタ
+                    ApplyPayerCodeFilter tempWs, payerCodeCol, payerCode, lastRow, lastCol
+                    Sleep config.FilterDelay
+                    
+                    ' 件数カウント（サマリー用）
+                    Dim recordCount As Long
+                    recordCount = CountVisibleRows(tempWs, lastRow) - 1 ' ヘッダー除く
+                    
+                    logger.WriteLog "データ件数: " & recordCount & " 件"
+                    
+                    ' データを処理（保存確認付き）
+                    Dim saveSuccess As Boolean
+                    saveSuccess = ProcessFilteredDataWithVerification(tempWs, rootDir, category, payerCode, remarksCol, lastRow, lastCol, categoryFolderDict)
+                    
+                    processedCount = processedCount + 1
+                    
+                    If saveSuccess Then
+                        successCount = successCount + 1
+                        ' サマリーデータに追加（成功時のみ）
+                        Dim summaryKey As String
+                        summaryKey = category & "|" & payerCode
+                        summaryData.Add summaryKey, recordCount
+                    End If
+                    
+                End If
+            Next j
+        End If
+    Next i
+    
+    ' フィルタを安全にクリアしてから一時シートを削除
+    On Error Resume Next
+    If tempWs.AutoFilterMode Then
+        tempWs.AutoFilter.ShowAllData
+    End If
+    tempWs.AutoFilterMode = False
+    On Error GoTo 0
+    
+    ' 一時シートを削除
+    CleanupTempSheet tempWs
+    
+    ' サマリーファイル生成（成功/失敗情報付き）
+    If config.SummaryOut Then
+        GenerateSummaryFileWithFailures rootDir, originalWs.Parent.Name, summaryData, failedSaves, processedCount, successCount
+    End If
+    
+    ' アプリケーション設定を復元
+    RestoreApplicationSettings
+    
+    logger.WriteLog "処理完了: 成功 " & successCount & " 件 / 全体 " & processedCount & " 件"
+    logger.LogMethodEnd "DataSorter", successCount & "/" & processedCount & " 件処理完了"
+    
+    ' 完了メッセージ
+    Dim completeMsg As String
+    completeMsg = "処理が完了しました。" & vbCrLf & _
+                  "成功: " & successCount & " 件" & vbCrLf & _
+                  "失敗: " & (processedCount - successCount) & " 件" & vbCrLf & _
+                  "全体: " & processedCount & " 件"
+    
+    If failedSaves.Count > 0 Then
+        completeMsg = completeMsg & vbCrLf & vbCrLf & "失敗した処理の詳細はサマリーファイルをご確認ください。"
+    End If
+    
+    If config.SummaryOut Then
+        completeMsg = completeMsg & vbCrLf & "サマリーファイル: " & originalWs.Parent.Name & "_summary.txt"
+    End If
+    
+    If failedSaves.Count > 0 Then
+        MsgBox completeMsg, vbExclamation
+    Else
+        MsgBox completeMsg, vbInformation
+    End If
+    
+    Exit Sub
+    
+ErrorHandler:
+    logger.LogError "DataSorter", Err.Description
+    If Not tempWs Is Nothing Then
+        ' エラー時も同様にフィルタをクリアしてから削除
+        On Error Resume Next
+        tempWs.AutoFilterMode = False
+        On Error GoTo 0
+        CleanupTempSheet tempWs
+    End If
+    RestoreApplicationSettings
+    MsgBox "エラーが発生しました: " & Err.Description, vbCritical
+End Sub
+
+' 保存確認機能付きデータ処理関数
+Private Function ProcessFilteredDataWithVerification(ws As Worksheet, rootDir As String, category As Variant, payerCode As Variant, _
+                                                    remarksCol As Long, lastRow As Long, lastCol As Long, categoryFolderDict As Object) As Boolean
+    logger.LogMethodStart "ProcessFilteredDataWithVerification", category & " - " & payerCode
+    
+    Dim categoryFolder As String
+    Dim folderName As String
+    Dim fileName As String
+    Dim filePath As String
+    Dim newWb As Workbook
+    Dim newWs As Worksheet
+    Dim sheetName As String
+    Dim visibleRange As Range
+    Dim remarkValue As Variant
+    Dim fileExists As Boolean
+    Dim retryCount As Long
+    Dim saveSuccess As Boolean
+    
+    ' 種別に対応するフォルダ名を取得
+    If categoryFolderDict.Exists(category) Then
+        folderName = categoryFolderDict(category)
+    Else
+        folderName = category
+    End If
+    
+    ' 種別フォルダのパスを作成
+    categoryFolder = rootDir & "\" & folderName
+    
+    ' 種別フォルダが存在しない場合は作成
+    If Dir(categoryFolder, vbDirectory) = "" Then
+        MkDir categoryFolder
+        Sleep config.FolderCreateDelay
+        logger.WriteLog "フォルダ作成: " & categoryFolder
+    End If
+    
+    ' ファイル名とパスを作成
+    fileName = payerCode & "_" & category & ".xlsx"
+    filePath = categoryFolder & "\" & fileName
+    
+    ' 備考列から値を取得（シート名用）
+    remarkValue = GetFirstVisibleValue(ws, remarksCol, lastRow)
+    sheetName = CleanSheetName(CStr(remarkValue))
+    
+    ' 可視セル範囲を取得（ヘッダー含む）
+    Set visibleRange = ws.Range(ws.Cells(1, 1), ws.Cells(lastRow, lastCol)).SpecialCells(xlCellTypeVisible)
+    
+    ' 保存リトライループ
+    For retryCount = 1 To config.SaveRetryCount
+        logger.WriteLog "保存試行 " & retryCount & "/" & config.SaveRetryCount
+        
+        ' ファイルの存在確認
+        fileExists = (Dir(filePath) <> "")
+        logger.WriteLog "ファイル: " & fileName & " (存在:" & fileExists & ")"
+        
+        Set newWb = Nothing
+        Set newWs = Nothing
+        
+        On Error Resume Next
+        
+        If fileExists Then
+            ' 既存ファイルを開いて新しいシートを追加
+            Set newWb = Workbooks.Open(filePath)
+            Sleep config.WorkbookOpenDelay
+            
+            If Not newWb Is Nothing Then
+                Set newWs = newWb.Worksheets.Add
+                Sleep config.SheetCreateDelay
+                
+                newWs.Name = GetUniqueSheetName(newWb, sheetName)
+                logger.WriteLog "既存ファイルに新シート追加: " & newWs.Name
+            End If
+        Else
+            ' 新規ファイルを作成
+            Set newWb = Workbooks.Add
+            Sleep config.WorkbookCreateDelay
+            
+            If Not newWb Is Nothing Then
+                Set newWs = newWb.Worksheets(1)
+                newWs.Name = sheetName
+                logger.WriteLog "新規ファイル作成: " & fileName & " シート: " & sheetName
+            End If
+        End If
+        
+        ' データをコピー&ペースト
+        If Not newWs Is Nothing Then
+            visibleRange.Copy
+            Sleep config.CopyPasteDelay
+            
+            newWs.Range("A1").PasteSpecial xlPasteAll
+            Application.CutCopyMode = False
+            Sleep config.CopyPasteDelay
+            
+            ' 新しいシートのヘッダー行にも背景色を設定
+            SetHeaderBackgroundColor newWs, lastCol, config.HeaderBackgroundColor
+            
+            ' ファイルを保存
+            If fileExists Then
+                newWb.Save
+            Else
+                newWb.SaveAs filePath, FileFormat:=xlOpenXMLWorkbook
+            End If
+            
+            Sleep config.SaveDelay
+            
+            ' ワークブックを閉じる
+            newWb.Close
+            Sleep config.WorkbookCloseDelay
+            
+            ' 保存確認
+            Sleep config.SaveVerifyDelay
+            saveSuccess = VerifyFileSave(filePath, CStr(payerCode), CStr(category), sheetName)
+            
+            If saveSuccess Then
+                logger.WriteLog "保存確認成功: " & filePath
+                ProcessFilteredDataWithVerification = True
+                Exit Function
+            Else
+                logger.WriteLog "保存確認失敗: " & filePath & " (リトライ " & retryCount & ")"
+            End If
+        Else
+            logger.WriteLog "ワークブック/シート作成失敗 (リトライ " & retryCount & ")"
+        End If
+        
+        On Error GoTo 0
+        
+        ' リトライ前の待機
+        If retryCount < config.SaveRetryCount Then
+            Sleep config.SaveVerifyDelay
+        End If
+    Next retryCount
+    
+    ' 全てのリトライが失敗した場合
+    Dim failureKey As String
+    failureKey = category & "|" & payerCode & "|" & sheetName
+    failedSaves.Add failureKey, Format(Now, "yyyy/mm/dd hh:nn:ss")
+    
+    logger.LogError "ProcessFilteredDataWithVerification", "保存失敗: " & failureKey
+    ProcessFilteredDataWithVerification = False
+    
+    logger.LogMethodEnd "ProcessFilteredDataWithVerification", "失敗"
+End Function
+
+' ファイル保存確認関数
+Private Function VerifyFileSave(filePath As String, expectedPayerCode As String, _
+                               expectedCategory As String, expectedSheetName As String) As Boolean
+    logger.LogMethodStart "VerifyFileSave", filePath & " - " & expectedSheetName
+    
+    On Error Resume Next
+    
+    ' ファイル存在確認
+    If Dir(filePath) = "" Then
+        logger.WriteLog "確認失敗: ファイルが存在しない"
+        VerifyFileSave = False
+        Exit Function
+    End If
+    
+    ' 再オープンして確認
+    Dim testWb As Workbook
+    Set testWb = Workbooks.Open(filePath)
+    
+    If testWb Is Nothing Then
+        logger.WriteLog "確認失敗: ファイルを開けない"
+        VerifyFileSave = False
+        Exit Function
+    End If
+    
+    ' 期待するシート名が存在するかチェック
+    Dim targetSheet As Worksheet
+    Set targetSheet = Nothing
+    
+    Dim ws As Worksheet
+    For Each ws In testWb.Worksheets
+        If ws.Name = expectedSheetName Then
+            Set targetSheet = ws
+            Exit For
+        End If
+    Next ws
+    
+    If targetSheet Is Nothing Then
+        logger.WriteLog "確認失敗: 期待するシート名が見つからない - " & expectedSheetName
+        testWb.Close False
+        VerifyFileSave = False
+        Exit Function
+    End If
+    
+    ' データ内容確認（支払先コード×種別が一致するか）
+    Dim dataMatch As Boolean
+    dataMatch = False
+    
+    ' 2行目以降のデータをチェック
+    Dim lastRow As Long
+    lastRow = targetSheet.Cells(targetSheet.Rows.Count, 1).End(xlUp).Row
+    
+    If lastRow >= 2 Then
+        ' 支払先コードと種別の列を探して確認
+        Dim payerCol As Long, categoryCol As Long
+        Dim i As Long
+        
+        For i = 1 To targetSheet.Cells(1, targetSheet.Columns.Count).End(xlToLeft).Column
+            If targetSheet.Cells(1, i).Value = "支払先コード" Then payerCol = i
+            If targetSheet.Cells(1, i).Value = "種別" Then categoryCol = i
+        Next i
+        
+        ' データが存在し、期待値と一致するかチェック
+        If payerCol > 0 And categoryCol > 0 Then
+            If CStr(targetSheet.Cells(2, payerCol).Value) = expectedPayerCode And _
+               CStr(targetSheet.Cells(2, categoryCol).Value) = expectedCategory Then
+                dataMatch = True
+                logger.WriteLog "確認成功: データ一致確認完了"
+            Else
+                logger.WriteLog "確認失敗: データ不一致 - 期待:" & expectedPayerCode & "/" & expectedCategory & _
+                              " 実際:" & targetSheet.Cells(2, payerCol).Value & "/" & targetSheet.Cells(2, categoryCol).Value
+            End If
+        Else
+            logger.WriteLog "確認失敗: 必要な列が見つからない"
+        End If
+    Else
+        logger.WriteLog "確認失敗: データ行が存在しない"
+    End If
+    
+    testWb.Close False
+    VerifyFileSave = dataMatch
+    
+    On Error GoTo 0
+    logger.LogMethodEnd "VerifyFileSave", IIf(dataMatch, "成功", "失敗")
+End Function
+
+' サマリーファイル生成関数（失敗情報付き）
+Private Sub GenerateSummaryFileWithFailures(rootDir As String, bookName As String, summaryData As Object, _
+                                           failedSaves As Object, totalProcessed As Long, successCount As Long)
+    logger.LogMethodStart "GenerateSummaryFileWithFailures"
+    
+    Dim summaryFolder As String
+    Dim summaryFileName As String
+    Dim summaryContent As String
+    Dim fileNum As Integer
+    Dim summaryKey As String
+    Dim keys As Variant
+    Dim i As Long
+    Dim parts As Variant
+    Dim category As String, payerCode As String, sheetName As String, recordCount As Long
+    
+    ' サマリーフォルダのパスを作成
+    summaryFolder = rootDir & "\summary"
+    
+    ' サマリーフォルダが存在しない場合は作成
+    If Dir(summaryFolder, vbDirectory) = "" Then
+        MkDir summaryFolder
+        logger.WriteLog "サマリーフォルダ作成: " & summaryFolder
+    End If
+    
+    ' サマリーファイル名を生成
+    summaryFileName = Replace(bookName, ".xlsx", "")
+    summaryFileName = Replace(summaryFileName, ".xlsm", "")
+    summaryFileName = Replace(summaryFileName, ".xls", "")
+    summaryFileName = summaryFolder & "\" & summaryFileName & "_summary.txt"
+    
+    ' サマリー内容のヘッダー作成
+    summaryContent = "データ仕分け処理レポート" & vbCrLf
+    summaryContent = summaryContent & "処理日時: " & Format(Now, "yyyy/mm/dd hh:nn:ss") & vbCrLf
+    summaryContent = summaryContent & "対象ブック: " & bookName & vbCrLf
+    summaryContent = summaryContent & String(70, "=") & vbCrLf & vbCrLf
+    
+    ' 処理結果サマリー
+    summaryContent = summaryContent & "【処理結果サマリー】" & vbCrLf
+    summaryContent = summaryContent & "全処理件数: " & totalProcessed & vbCrLf
+    summaryContent = summaryContent & "成功件数: " & successCount & vbCrLf
+    summaryContent = summaryContent & "失敗件数: " & failedSaves.Count & vbCrLf
+    
+    ' 成功率計算（安全版）
+    Dim successRate As String
+    If totalProcessed > 0 Then
+        Dim rate As Double
+        rate = (CDbl(successCount) / CDbl(totalProcessed)) * 100
+        successRate = CStr(Int(rate * 10) / 10) & "%"  ' 小数点1桁で四捨五入
+    Else
+        successRate = "0.0%"
+    End If
+    summaryContent = summaryContent & "成功率: " & successRate & vbCrLf
+    summaryContent = summaryContent & vbCrLf & String(70, "-") & vbCrLf & vbCrLf
+    
+    ' 成功した処理の詳細
+    If summaryData.Count > 0 Then
+        summaryContent = summaryContent & "【成功した処理】" & vbCrLf
+        summaryContent = summaryContent & "種別" & String(16, " ") & "支払先コード" & String(6, " ") & "件数" & vbCrLf
+        summaryContent = summaryContent & String(50, "-") & vbCrLf
+        
+        keys = summaryData.keys
+        For i = 0 To UBound(keys)
+            summaryKey = keys(i)
+            parts = Split(summaryKey, "|")
+            If UBound(parts) = 1 Then
+                category = parts(0)
+                payerCode = parts(1)
+                recordCount = summaryData(summaryKey)
+                
+                ' 固定幅で整列
+                Dim categoryPadded As String, payerCodePadded As String, countPadded As String
+                categoryPadded = PadString(category, 20)
+                payerCodePadded = PadString(payerCode, 12)
+                countPadded = String(6 - Len(CStr(recordCount)), " ") & CStr(recordCount)
+                
+                summaryContent = summaryContent & categoryPadded & payerCodePadded & countPadded & vbCrLf
+            End If
+        Next i
+        
+        summaryContent = summaryContent & vbCrLf
+    End If
+    
+    ' 失敗した処理の詳細
+    If failedSaves.Count > 0 Then
+        summaryContent = summaryContent & "【失敗した処理】" & vbCrLf
+        summaryContent = summaryContent & "種別" & String(16, " ") & "支払先コード" & String(6, " ") & "シート名" & String(14, " ") & "失敗時刻" & vbCrLf
+        summaryContent = summaryContent & String(70, "-") & vbCrLf
+        
+        Dim failedKeys As Variant
+        failedKeys = failedSaves.keys
+        For i = 0 To UBound(failedKeys)
+            summaryKey = failedKeys(i)
+            parts = Split(summaryKey, "|")
+            If UBound(parts) = 2 Then
+                category = parts(0)
+                payerCode = parts(1)
+                sheetName = parts(2)
+                
+                ' 固定幅で整列
+                categoryPadded = PadString(category, 20)
+                payerCodePadded = PadString(payerCode, 12)
+                Dim sheetNamePadded As String
+                sheetNamePadded = PadString(sheetName, 20)
+                
+                summaryContent = summaryContent & categoryPadded & payerCodePadded & sheetNamePadded & failedSaves(summaryKey) & vbCrLf
+            End If
+        Next i
+        
+        summaryContent = summaryContent & vbCrLf
+    End If
+    
+    ' 最終サマリー
+    summaryContent = summaryContent & String(70, "=") & vbCrLf
+    summaryContent = summaryContent & "【最終サマリー】" & vbCrLf
+    summaryContent = summaryContent & "処理完了時刻: " & Format(Now, "yyyy/mm/dd hh:nn:ss") & vbCrLf
+    
+    If failedSaves.Count = 0 Then
+        summaryContent = summaryContent & "ステータス: 全件処理成功" & vbCrLf
+    Else
+        summaryContent = summaryContent & "ステータス: 一部処理失敗" & vbCrLf
+        summaryContent = summaryContent & "※失敗した処理については、元データを確認の上、手動での処理をお願いします。" & vbCrLf
+    End If
+    
+    ' ファイルに書き込み
+    On Error Resume Next
+    fileNum = FreeFile
+    Open summaryFileName For Output As fileNum
+    
+    If Err.Number = 0 Then
+        Print #fileNum, summaryContent
+        Close fileNum
+        logger.WriteLog "サマリーファイル作成完了: " & summaryFileName
+    Else
+        logger.LogError "GenerateSummaryFileWithFailures", "ファイル作成失敗: " & Err.Description
+        MsgBox "サマリーファイルの作成に失敗しました: " & Err.Description, vbExclamation
+    End If
+    On Error GoTo 0
+    
+    logger.LogMethodEnd "GenerateSummaryFileWithFailures"
+End Sub
+
+' アプリケーション設定復元関数
+Private Sub RestoreApplicationSettings()
+    logger.LogMethodStart "RestoreApplicationSettings"
+    Application.ScreenUpdating = True
+    Application.Calculation = xlCalculationAutomatic
+    Application.EnableEvents = True
+    Application.StatusBar = False
+    logger.LogMethodEnd "RestoreApplicationSettings"
+End Sub
+
+' ルートディレクトリ選択関数
+Private Function SelectRootDirectory() As String
+    logger.LogMethodStart "SelectRootDirectory"
+    
+    Dim folderDialog As FileDialog
+    Set folderDialog = Application.FileDialog(msoFileDialogFolderPicker)
+    
+    With folderDialog
+        .Title = "保存先のルートディレクトリを選択してください"
+        .AllowMultiSelect = False
+        If .Show = -1 Then
+            SelectRootDirectory = .SelectedItems(1)
+            logger.LogMethodEnd "SelectRootDirectory", .SelectedItems(1)
+        Else
+            SelectRootDirectory = config.EmptyValue
+            logger.LogMethodEnd "SelectRootDirectory", "キャンセル"
+        End If
+    End With
+End Function
+
+' 一時シート作成とデータコピー関数
+Private Function CreateTempSheet(originalWs As Worksheet) As Worksheet
+    logger.LogMethodStart "CreateTempSheet", originalWs.Name
+    
+    Dim tempWs As Worksheet
+    Dim dataRange As Range
+    Dim lastRow As Long, lastCol As Long
+    
+    ' データ範囲を取得
+    lastRow = originalWs.Cells(originalWs.Rows.Count, 1).End(xlUp).Row
+    lastCol = originalWs.Cells(1, originalWs.Columns.Count).End(xlToLeft).Column
+    
+    ' データ範囲を設定
+    Set dataRange = originalWs.Range(originalWs.Cells(1, 1), originalWs.Cells(lastRow, lastCol))
+    
+    ' 一時シートを作成
+    Set tempWs = originalWs.Parent.Worksheets.Add
+    tempWs.Name = "temp_" & Format(Now, "yyyymmddhhmmss")
+    
+    ' データを値として貼り付け
+    dataRange.Copy
+    tempWs.Range("A1").PasteSpecial xlPasteValues
+    Application.CutCopyMode = False
+    
+    Set CreateTempSheet = tempWs
+    logger.LogMethodEnd "CreateTempSheet", tempWs.Name & " (" & lastRow & "x" & lastCol & ")"
+End Function
+
+' 一時シート削除関数
+Private Sub CleanupTempSheet(tempWs As Worksheet)
+    If Not tempWs Is Nothing Then
+        logger.LogMethodStart "CleanupTempSheet", tempWs.Name
+        
+        On Error Resume Next
+        
+        ' アクティブシートの場合は別のシートをアクティブにする
+        If tempWs Is ActiveSheet Then
+            ' 他のシートをアクティブにする
+            Dim otherWs As Worksheet
+            For Each otherWs In tempWs.Parent.Worksheets
+                If otherWs.Name <> tempWs.Name Then
+                    otherWs.Activate
+                    Exit For
+                End If
+            Next otherWs
+        End If
+        
+        ' フィルタをクリア
+        tempWs.AutoFilterMode = False
+        
+        ' シートの保護を解除（もしある場合）
+        tempWs.Unprotect
+        
+        ' アラートを無効にしてシート削除
+        Application.DisplayAlerts = False
+        tempWs.Delete
+        Application.DisplayAlerts = True
+        
+        On Error GoTo 0
+        logger.LogMethodEnd "CleanupTempSheet", "削除完了"
+    End If
+End Sub
+
+' データ範囲とカラム位置取得関数
+Private Function GetDataRange(ws As Worksheet, ByRef lastRow As Long, ByRef lastCol As Long, _
+                             ByRef payerCodeCol As Long, ByRef categoryCol As Long, ByRef remarksCol As Long) As Boolean
+    logger.LogMethodStart "GetDataRange"
+    
+    Dim i As Long
+    Dim headerValue As String
+    
+    ' データ範囲を取得
+    lastRow = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
+    lastCol = ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
+    
+    ' カラム位置を初期化
+    payerCodeCol = 0
+    categoryCol = 0
+    remarksCol = 0
+    
+    ' ヘッダー行からカラム位置を特定
+    For i = 1 To lastCol
+        headerValue = Trim(ws.Cells(1, i).Value)
+        Select Case headerValue
+            Case "支払先コード"
+                payerCodeCol = i
+            Case "種別"
+                categoryCol = i
+            Case "備考"
+                remarksCol = i
+        End Select
+    Next i
+    
+    ' 必要なカラムが全て見つかったかチェック
+    GetDataRange = (payerCodeCol > 0 And categoryCol > 0 And remarksCol > 0)
+    
+    logger.LogMethodEnd "GetDataRange", "支払先:" & payerCodeCol & " 種別:" & categoryCol & " 備考:" & remarksCol
+End Function
+
+' ヘッダー行背景色設定関数
+Private Sub SetHeaderBackgroundColor(ws As Worksheet, categoryCol As Long, colorCode As String)
+    logger.LogMethodStart "SetHeaderBackgroundColor", colorCode
+    
+    Dim headerRange As Range
+    Set headerRange = ws.Range(ws.Cells(1, 1), ws.Cells(1, categoryCol))
+    
+    ' カラーコードをRGBに変換して適用
+    headerRange.Interior.Color = ColorCodeToRGB(colorCode)
+    
+    logger.LogMethodEnd "SetHeaderBackgroundColor"
+End Sub
+
+' カラーコード変換関数
+Private Function ColorCodeToRGB(colorCode As String) As Long
+    Dim hexColor As String
+    hexColor = Replace(colorCode, "#", "")
+    ColorCodeToRGB = RGB(Val("&H" & Mid(hexColor, 1, 2)), _
+                        Val("&H" & Mid(hexColor, 3, 2)), _
+                        Val("&H" & Mid(hexColor, 5, 2)))
+End Function
+
+' 種別列以降の列削除関数
+Private Sub DeleteColumnsAfterCategory(ws As Worksheet, categoryCol As Long, lastCol As Long, lastRow As Long)
+    logger.LogMethodStart "DeleteColumnsAfterCategory", "種別列:" & categoryCol & " 最終列:" & lastCol
+    
+    If categoryCol < lastCol Then
+        ' 種別列以降の値と背景色をクリア
+        Dim clearRange As Range
+        Set clearRange = ws.Range(ws.Cells(1, categoryCol + 1), ws.Cells(lastRow, lastCol))
+        
+        ' 値をクリア
+        clearRange.ClearContents
+        
+        ' 背景色をクリア
+        clearRange.Interior.Color = xlNone
+        
+        ' 列を削除
+        ws.Range(ws.Cells(1, categoryCol + 1), ws.Cells(1, lastCol)).EntireColumn.Delete
+        
+        logger.LogMethodEnd "DeleteColumnsAfterCategory", (lastCol - categoryCol) & " 列削除"
+    Else
+        logger.LogMethodEnd "DeleteColumnsAfterCategory", "削除対象なし"
+    End If
+End Sub
+
+' N/A除外フィルタ適用関数
+Private Sub ApplyNAFilter(ws As Worksheet, categoryCol As Long, lastRow As Long, lastCol As Long)
+    logger.LogMethodStart "ApplyNAFilter", "種別列:" & categoryCol
+    
+    Dim filterRange As Range
+    Set filterRange = ws.Range(ws.Cells(1, 1), ws.Cells(lastRow, lastCol))
+    
+    ' オートフィルタを設定（#N/Aを除外）
+    filterRange.AutoFilter Field:=categoryCol, Criteria1:="<>" & config.NAValue
+    
+    logger.LogMethodEnd "ApplyNAFilter"
+End Sub
+
+' 種別フィルタ適用関数
+Private Sub ApplyCategoryFilter(ws As Worksheet, categoryCol As Long, category As Variant, lastRow As Long, lastCol As Long)
+    logger.LogMethodStart "ApplyCategoryFilter", "種別:" & category
+    
+    On Error Resume Next
+    
+    ' AutoFilterが存在する場合のみShowAllDataを実行
+    If ws.AutoFilterMode Then
+        ws.AutoFilter.ShowAllData
+    End If
+    
+    On Error GoTo 0
+    
+    ' フィルタを適用
+    ws.Range(ws.Cells(1, 1), ws.Cells(lastRow, lastCol)).AutoFilter Field:=categoryCol, Criteria1:=category
+    
+    logger.LogMethodEnd "ApplyCategoryFilter"
+End Sub
+
+' 支払先コードフィルタ適用関数
+Private Sub ApplyPayerCodeFilter(ws As Worksheet, payerCodeCol As Long, payerCode As Variant, lastRow As Long, lastCol As Long)
+    logger.LogMethodStart "ApplyPayerCodeFilter", "支払先:" & payerCode
+    
+    ' 支払先コードでフィルタ（ShowAllDataは不要、既存フィルタに追加）
+    ws.Range(ws.Cells(1, 1), ws.Cells(lastRow, lastCol)).AutoFilter Field:=payerCodeCol, Criteria1:=payerCode
+    
+    logger.LogMethodEnd "ApplyPayerCodeFilter"
+End Sub
+
+' 一意値取得関数（Dictionary使用で高速化）
+Private Function GetUniqueValuesDictionary(ws As Worksheet, colNum As Long, lastRow As Long) As Object
+    logger.LogMethodStart "GetUniqueValuesDictionary", "列:" & colNum
+    
+    Dim uniqueDict As Object
+    Set uniqueDict = CreateObject("Scripting.Dictionary")
+    Dim cellValue As Variant
+    Dim visibleCell As Range
+    Dim cellRange As Range
+    
+    On Error Resume Next
+    
+    ' 可視セル範囲を取得
+    Set cellRange = ws.Range(ws.Cells(2, colNum), ws.Cells(lastRow, colNum)).SpecialCells(xlCellTypeVisible)
+    
+    ' 可視セルが存在するかチェック
+    If Not cellRange Is Nothing Then
+        ' 可視セルのみを対象にする
+        For Each visibleCell In cellRange
+            cellValue = Trim(visibleCell.Value)
+            If cellValue <> config.EmptyValue And cellValue <> config.NAValue And Not IsError(visibleCell.Value) Then
+                ' Dictionaryの高速Existsメソッドで重複チェック
+                If Not uniqueDict.Exists(cellValue) Then
+                    uniqueDict.Add cellValue, True
+                End If
+            End If
+        Next visibleCell
+    End If
+    
+    On Error GoTo 0
+    Set GetUniqueValuesDictionary = uniqueDict
+    
+    logger.LogMethodEnd "GetUniqueValuesDictionary", uniqueDict.Count & " 件"
+End Function
+
+' 可視行数をカウントする関数
+Private Function CountVisibleRows(ws As Worksheet, lastRow As Long) As Long
+    Dim visibleCount As Long
+    Dim i As Long
+    
+    visibleCount = 0
+    
+    For i = 1 To lastRow
+        If Not ws.Rows(i).Hidden Then
+            visibleCount = visibleCount + 1
+        End If
+    Next i
+    
+    CountVisibleRows = visibleCount
+End Function
+
+' 最初の可視セル値を取得する関数
+Private Function GetFirstVisibleValue(ws As Worksheet, colNum As Long, lastRow As Long) As Variant
+    Dim visibleCell As Range
+    
+    For Each visibleCell In ws.Range(ws.Cells(2, colNum), ws.Cells(lastRow, colNum)).SpecialCells(xlCellTypeVisible)
+        If Not IsError(visibleCell.Value) And Trim(visibleCell.Value) <> config.EmptyValue And Trim(visibleCell.Value) <> config.NAValue Then
+            GetFirstVisibleValue = visibleCell.Value
+            Exit Function
+        End If
+    Next visibleCell
+    
+    GetFirstVisibleValue = config.DefaultSheetName ' デフォルト値
+End Function
+
+' シート名をクリーンアップする関数（改良版）
+Private Function CleanSheetName(sheetName As String) As String
+    Dim i As Integer
+    Dim cleanName As String
+    Dim char As String
+    
+    cleanName = Trim(sheetName)
+    
+    ' 無効な文字を一文字ずつチェックして置換
+    For i = 1 To Len(cleanName)
+        char = Mid(cleanName, i, 1)
+        If InStr(config.InvalidSheetChars, char) > 0 Then
+            cleanName = Replace(cleanName, char, "_")
+        End If
+    Next i
+    
+    ' 長さ制限
+    If Len(cleanName) > config.MaxSheetNameLength Then
+        cleanName = Left(cleanName, config.MaxSheetNameLength)
+    End If
+    
+    ' 空の場合はデフォルト名
+    If cleanName = config.EmptyValue Then
+        cleanName = config.DefaultSheetName
+    End If
+    
+    CleanSheetName = cleanName
+End Function
+
+' 重複しないシート名を取得する関数
+Private Function GetUniqueSheetName(wb As Workbook, baseName As String) As String
+    Dim sheetName As String
+    Dim counter As Long
+    Dim sheetExists As Boolean
+    
+    sheetName = baseName
+    counter = 1
+    
+    Do
+        sheetExists = False
+        
+        ' シート名の存在確認
+        Dim ws As Worksheet
+        For Each ws In wb.Worksheets
+            If ws.Name = sheetName Then
+                sheetExists = True
+                Exit For
+            End If
+        Next ws
+        
+        ' 重複している場合は連番を付ける
+        If sheetExists Then
+            counter = counter + 1
+            sheetName = baseName & "_" & counter
+        End If
+        
+    Loop While sheetExists
+    
+    GetUniqueSheetName = sheetName
+End Function
+
+' 文字列パディング関数（全角文字対応）
+Private Function PadString(text As String, width As Integer) As String
+    Dim textLen As Integer
+    Dim paddingLen As Integer
+    Dim result As String
+    
+    ' 全角文字を考慮した文字幅を計算
+    textLen = GetStringWidth(text)
+    
+    ' パディング長を計算
+    paddingLen = width - textLen
+    If paddingLen < 0 Then paddingLen = 0
+    
+    ' パディングを追加
+    result = text & String(paddingLen, " ")
+    
+    PadString = result
+End Function
+
+' 文字列の表示幅を取得する関数（全角文字対応）
+Private Function GetStringWidth(text As String) As Integer
+    Dim i As Integer
+    Dim width As Integer
+    Dim char As String
+    
+    width = 0
+    For i = 1 To Len(text)
+        char = Mid(text, i, 1)
+        ' 全角文字は2文字分、半角文字は1文字分として計算
+        If Asc(char) > 255 Or Asc(char) < 0 Then
+            width = width + 2  ' 全角文字
+        Else
+            width = width + 1  ' 半角文字
+        End If
+    Next i
+    
+    GetStringWidth = width
+End Function
+
